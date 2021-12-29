@@ -1,0 +1,170 @@
+open Globals
+open Mathext
+
+const rotate_speed : float = 109.24 (* got thanks to experimentation, turn of ~ 1° *)
+
+(****** utils func ****)
+fun motor_percent(speed, percent : float) returns (new_speed : float)
+let
+  (* perecentage is given in the interval [-100, 100] *)
+  new_speed = speed *. (percent /. 100.0);
+tel
+
+fun speed_to_rspeed(speed : float) returns (rspeed : float)
+let
+  rspeed = speed *. 20.83; (* got thanks to experimentation *)
+tel
+
+(****** Debug func *****)
+node print_green_time(green_time, green_lock, speed : float) returns ()
+let
+  automaton
+    state PRINT
+      do () = Debug.dbg_float("green time", green_time); () = Debug.dbg_float("green lock", green_lock); () = Debug.dbg_float("limit", (0.1 *. (speed_to_rspeed(20.0) /. speed) -. 0.001));
+      until green_time = 0.0 and green_lock = 0.0 then NOPRINT
+
+    state NOPRINT
+      do
+      unless green_time <> 0.0 then PRINT
+  end
+tel
+
+node print_action(act : action; param : float; end_action : bool) returns ()
+let
+  automaton
+    state NOPRINT
+      do
+      unless end_action then PRINT
+
+    state PRINT
+      do () = dbg_action("action", act); () = Debug.dbg_float("param", param);
+      until not end_action then NOPRINT
+  end
+tel
+
+(******* pid ********)
+node pid(error, kp, ki, kd : float;) returns (correction : float)
+var err , p_gain,i_gain, d_gain: float;
+let
+	err = 0.0 -> pre error;
+	
+	p_gain = kp *. err;
+	i_gain = ki *. Utilities.integrator(err, timestep, 0.0);
+	d_gain = kd *. Utilities.derivative(err, timestep);
+	
+	(*() = Debug.dbg_float("i_gain?: ", i_gain); () = Debug.dbg_float("d_gain?: ", d_gain);*)
+	
+ 	correction = p_gain +. i_gain +. d_gain;
+tel
+
+(******** turn decoder ********)
+fun turn_decoder(sens: sensors) returns (turn : float)
+var denominateur : float;
+let
+	denominateur = float(sens.s_road.blue);
+	turn = if (denominateur <> 0.0) then ((float(sens.s_road.red) -. float(sens.s_road.green) ) /. denominateur) else 0.0 ; 
+tel
+
+(******** Heuristic method ********)
+
+fun methode_heuristique() returns(kp, ki, kd : float)
+var ti, td: float;
+let
+	kp = 8.8;
+	ti = 6.3;
+	td = 0.44;
+	ki = if (ti <> 0.0) then (kp /. ti) else 0.0;
+	kd = td*. kp;
+tel
+
+(******** go straight ********)
+node follow_line(sens : sensors; speed : float)
+       returns (rspeed : wheels)
+var pid_value : float; adjust_speed : float; kp, ki, kd: float;
+let
+	(kp, ki, kd) = methode_heuristique();
+
+  (* let's represent the pid_value as a percentage [-100, 100], 
+    with the idear that's not matter which speed the pid_value will be somewhat accurate *)
+  pid_value = Utilities.bound(pid(turn_decoder(sens), kp, ki, kd), 100.0);
+  adjust_speed = motor_percent(speed, pid_value);
+  
+  (* I saw sometime the rspeed = 619 in 03.map and 05.map (which would increase more errros in pid), but the sujet ask us to limit the rspeed <= 500. *)
+  rspeed = {left = Utilities.bound((speed -. adjust_speed),cMAXWHEEL) ; right = Utilities.bound((speed +. adjust_speed),cMAXWHEEL)};
+tel
+
+(**** move according lamp, obstacle and line *****)
+node move_forward(sens : sensors; speed : float) 
+  returns (rspeed: wheels; end_action : bool)
+var red_lamp, obstacle : bool; green_time, green_lock : float;
+let
+  red_lamp = Utilities.compare_colors(sens.s_road, red) >. 0.9 and 
+    (Utilities.compare_colors(sens.s_front, red) = 1.0 or Utilities.compare_colors(sens.s_front, amber) = 1.0);
+  obstacle = sens.s_sonar < 100;
+
+  green_time = 0.0 fby (if Utilities.compare_colors(sens.s_road, green) >. 0.95 then green_time +. timestep else 0.0);
+  green_lock = 0.0 fby (if (end_action or green_lock >. 0.0) and green_lock <. 1.0 then green_lock +. timestep else 0.0);
+
+  (* by experimentation we know that green block are crossed in max 0.1 at speed 20 
+      but sometimes due to the car not going in straight line the count is not properly active
+      and we want to avoid linked green to activate at the same time
+      therefor a lock of 1 second
+  *)
+  end_action = ((green_time >=. 0.1 *. (speed_to_rspeed(20.0) /. speed -. 0.001))
+    or (false -> (pre green_time >=. 0.05 *. (speed_to_rspeed(20.0) /. speed -. 0.001) and green_time = 0.0)))
+    and green_lock = 0.0;
+
+  automaton
+    state LINE
+      do rspeed = follow_line(sens, speed);
+      unless red_lamp then RED | obstacle continue OBSTACLE
+    state RED
+      do rspeed = {left = 0.0; right = 0.0};
+      unless obstacle continue OBSTACLE | (not red_lamp) continue LINE 
+    state OBSTACLE
+      do rspeed = follow_line(sens, speed *. (Mathext.float(sens.s_sonar - 10) /. 100.0));
+      unless red_lamp then RED | (not obstacle) continue LINE
+  end
+tel
+
+(********* turn 1° **************)
+fun turn(angle : float) returns (rspeed : wheels; arriving : bool; new_angle : float)
+var rotate : float;
+let
+  (rotate, new_angle) = if angle >. 0.0 then (rotate_speed, angle -. 1.0) else (-. rotate_speed, angle +. 1.0);
+  rspeed = {left = -. rotate; right = rotate};
+  arriving = -. 1.0 <. new_angle and new_angle <. 1.0; (* no need to turn if we are aproximately at one degree *)
+tel
+
+
+(******* angle controller ********)
+node angle_controller(init_angle : float) returns (rspeed : wheels; end_action : bool)
+var angle, new_angle : float;
+let
+  angle = init_angle fby new_angle;
+  (rspeed, end_action, new_angle) = turn(angle);
+tel
+
+(******** controller ************)
+node controller(sens : sensors; iti : itielts)
+       returns (rspeed : wheels; arriving : bool)
+var curr_action : action; curr_param : float; curr_itinum : int; end_action : bool;
+let
+  
+
+  curr_action = (iti[>curr_itinum<]).act;
+  curr_param = (iti[>curr_itinum<]).param;
+  curr_itinum = 0 fby (curr_itinum + if end_action then 1 else 0);
+
+  automaton
+    state MOVE
+      do (rspeed, end_action) = move_forward(sens, speed_to_rspeed(curr_param)); arriving = false;
+      unless curr_action = Turn then TURN | curr_action = Stop then END
+    state TURN
+      do (rspeed, end_action) = angle_controller(curr_param); arriving = false;
+      unless curr_action = Go then MOVE | curr_action = Stop then END
+    state END
+      do  arriving = true; rspeed = {left = 0.0; right = 0.0}; end_action = false;
+  end
+tel
+
